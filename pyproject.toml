@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2md-local"
+version = "0.1.0"
+description = "Convert PDF files to Markdown and keep embedded images in reading order."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyMuPDF>=1.24",
+  "fastapi>=0.110",
+  "python-multipart>=0.0.9",
+  "uvicorn>=0.29",
+]
+
+[project.scripts]
+pdf2md = "pdf2md.cli:main"
+pdf2md-web = "pdf2md.web:main"
+
+[tool.setuptools.packages.find]
+include = ["pdf2md*"]
+
