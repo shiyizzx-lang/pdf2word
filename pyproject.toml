@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "PyMuPDF>=1.24",
+  "numpy>=1.24",
+  "Pillow>=10",
   "fastapi>=0.110",
   "python-multipart>=0.0.9",
   "uvicorn>=0.29",
@@ -18,7 +20,7 @@ dependencies = [
 [project.scripts]
 pdf2md = "pdf2md.cli:main"
 pdf2md-web = "pdf2md.web:main"
+pdf-watermark-web = "watermark_remover.web:main"
 
 [tool.setuptools.packages.find]
-include = ["pdf2md*"]
-
+include = ["pdf2md*", "watermark_remover*"]

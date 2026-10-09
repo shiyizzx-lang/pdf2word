@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import re
+import shutil
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +22,8 @@ class ConversionOptions:
     min_image_width: int = 24
     min_image_height: int = 24
     ocr_language: str | None = None
+    auto_ocr: bool = True
+    detect_tables: bool = True
 
 
 @dataclass
@@ -81,7 +87,7 @@ def _escape_markdown(text: str) -> str:
     return text.strip()
 
 
-def _line_text(line: dict[str, Any]) -> str:
+def _line_text(line: dict[str, Any], *, ocr: bool = False) -> str:
     spans = line.get("spans", [])
     if not spans:
         return ""
@@ -94,14 +100,12 @@ def _line_text(line: dict[str, Any]) -> str:
             continue
         x0 = float(span.get("bbox", (0, 0, 0, 0))[0])
         size = max(float(span.get("size", 10)), 1.0)
-        if (
-            result
-            and previous_x1 is not None
-            and x0 - previous_x1 > size * 0.18
-            and not previous_text.endswith((" ", "-"))
-            and not current.startswith((" ", ",", ".", ":", ";", "!", "?", "，", "。", "：", "；", "！", "？", "、"))
-        ):
-            result += " "
+        if result and not previous_text.endswith((" ", "-")) and not current.startswith((" ", ",", ".", ":", ";", "!", "?", "，", "。", "：", "；", "！", "？", "、")):
+            if ocr:
+                if not (_is_cjk(previous_text[-1]) or _is_cjk(current[0])):
+                    result += " "
+            elif previous_x1 is not None and x0 - previous_x1 > size * 0.18:
+                result += " "
         result += current
         previous_x1 = float(span.get("bbox", (0, 0, 0, 0))[2])
         previous_text = current
@@ -132,12 +136,12 @@ def _is_bold(span: dict[str, Any]) -> bool:
     return "bold" in name or "black" in name or "semibold" in name
 
 
-def _text_block_to_markdown(block: dict[str, Any], body_size: float) -> str:
-    lines = [line for line in block.get("lines", []) if _line_text(line)]
+def _text_block_to_markdown(block: dict[str, Any], body_size: float, *, ocr: bool = False) -> str:
+    lines = [line for line in block.get("lines", []) if _line_text(line, ocr=ocr)]
     if not lines:
         return ""
 
-    texts = [_line_text(line) for line in lines]
+    texts = [_line_text(line, ocr=ocr) for line in lines]
     spans = [span for line in lines for span in line.get("spans", []) if span.get("text", "").strip()]
     max_size = max((float(span.get("size", body_size)) for span in spans), default=body_size)
     all_bold = bool(spans) and all(_is_bold(span) for span in spans)
@@ -168,7 +172,133 @@ def _text_block_to_markdown(block: dict[str, Any], body_size: float) -> str:
     return paragraph
 
 
-def _page_dict(page: fitz.Page, options: ConversionOptions, page_number: int, warnings: list[str]) -> dict[str, Any]:
+def _table_markdown(table: Any) -> str:
+    """Return a compact Markdown table, dropping empty trailing rows."""
+    rows = table.extract() or []
+    cleaned: list[list[str]] = []
+    for row in rows:
+        values = [str(value or "").replace("|", r"\|").replace("\n", " ").strip() for value in row]
+        if any(values):
+            cleaned.append(values)
+    if not cleaned or not any(cleaned[0]):
+        return ""
+    columns = max(len(row) for row in cleaned)
+    cleaned = [row + [""] * (columns - len(row)) for row in cleaned]
+    header = cleaned[0]
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join("---" for _ in header) + " |"]
+    lines.extend("| " + " | ".join(row) + " |" for row in cleaned[1:])
+    return "\n".join(lines)
+
+
+def _extract_tables(page: fitz.Page, warnings: list[str]) -> list[dict[str, Any]]:
+    """Find ruled or aligned-text tables with PyMuPDF's native detector."""
+    try:
+        # PyMuPDF may print an advisory about pymupdf_layout during detection.
+        # It is not a conversion warning and should not pollute CLI output.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            finder = page.find_tables(strategy="lines")
+            if not finder.tables:
+                # The text strategy catches borderless tables whose columns line up.
+                finder = page.find_tables(strategy="text")
+    except Exception as exc:
+        warnings.append(f"第 {page.number + 1} 页表格识别失败：{exc}")
+        return []
+    tables: list[dict[str, Any]] = []
+    for table in finder.tables:
+        markdown = _table_markdown(table)
+        if markdown:
+            tables.append({"type": "table", "bbox": tuple(table.bbox), "markdown": markdown})
+    return tables
+
+
+def _overlaps_table(block: dict[str, Any], table: dict[str, Any]) -> bool:
+    x0, y0, x1, y1 = block["bbox"]
+    tx0, ty0, tx1, ty1 = table["bbox"]
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    return tx0 - 2 <= cx <= tx1 + 2 and ty0 - 2 <= cy <= ty1 + 2
+
+
+def _detect_column_groups(blocks: list[dict[str, Any]], page_width: float) -> list[tuple[float, float]]:
+    """Detect columns from strong gaps between the left edges of narrow blocks."""
+    candidates = [
+        block for block in blocks
+        if block.get("type") in (0, 1) and block["bbox"][2] - block["bbox"][0] < page_width * 0.72
+    ]
+    starts = sorted(float(block["bbox"][0]) for block in candidates)
+    if len(starts) < 4:
+        return []
+    groups: list[list[float]] = [[starts[0]]]
+    for value in starts[1:]:
+        if value - groups[-1][-1] > page_width * 0.14:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    groups = [group for group in groups if len(group) >= 2]
+    if len(groups) < 2 or len(groups) > 3:
+        return []
+    boundaries: list[tuple[float, float]] = []
+    for index, group in enumerate(groups):
+        left = min(group) - page_width * 0.05
+        right = (min(groups[index + 1]) + min(group)) / 2 if index + 1 < len(groups) else page_width
+        boundaries.append((left, right))
+    return boundaries
+
+
+def _ordered_content_blocks(page: dict[str, Any]) -> list[dict[str, Any]]:
+    """Order blocks column-by-column while keeping full-width content around them."""
+    tables = page.get("_tables", [])
+    blocks = [
+        block for block in page.get("blocks", [])
+        if not any(_overlaps_table(block, table) for table in tables)
+    ]
+    blocks.extend(tables)
+    blocks = [block for block in blocks if block.get("bbox")]
+    if not blocks:
+        return []
+    columns = _detect_column_groups(blocks, float(page["width"]))
+    natural = sorted(blocks, key=lambda block: (round(block["bbox"][1], 1), block["bbox"][0]))
+    if not columns:
+        return natural
+
+    column_blocks: list[list[dict[str, Any]]] = [[] for _ in columns]
+    full_width: list[dict[str, Any]] = []
+    for block in blocks:
+        x0, _, x1, _ = block["bbox"]
+        center = (x0 + x1) / 2
+        assigned = next((index for index, (left, right) in enumerate(columns) if left <= center < right and x1 - x0 < page["width"] * 0.78), None)
+        if assigned is None:
+            full_width.append(block)
+        else:
+            column_blocks[assigned].append(block)
+    column_blocks = [sorted(group, key=lambda block: (round(block["bbox"][1], 1), block["bbox"][0])) for group in column_blocks]
+    if any(len(group) < 2 for group in column_blocks):
+        return natural
+    first_column_y = min(group[0]["bbox"][1] for group in column_blocks if group)
+    last_column_y = max(group[-1]["bbox"][3] for group in column_blocks if group)
+    prefix = sorted([block for block in full_width if block["bbox"][3] <= first_column_y], key=lambda block: block["bbox"][1])
+    suffix = sorted([block for block in full_width if block["bbox"][1] >= last_column_y], key=lambda block: block["bbox"][1])
+    middle = sorted([block for block in full_width if block not in prefix and block not in suffix], key=lambda block: block["bbox"][1])
+    return prefix + [block for group in column_blocks for block in group] + middle + suffix
+
+
+def _available_ocr_language(requested: str | None) -> str | None:
+    if requested:
+        return requested
+    if not shutil.which("tesseract"):
+        return None
+    try:
+        completed = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True, timeout=5, check=False)
+        languages = set(completed.stdout.splitlines()[1:])
+    except (OSError, subprocess.SubprocessError):
+        return "eng"
+    if "chi_sim" in languages and "eng" in languages:
+        return "chi_sim+eng"
+    if "eng" in languages:
+        return "eng"
+    return next(iter(languages), None)
+
+
+def _page_dict(page: fitz.Page, options: ConversionOptions, page_number: int, warnings: list[str], ocr_language: str | None) -> dict[str, Any]:
     flags = fitz.TEXTFLAGS_DICT | fitz.TEXT_PRESERVE_IMAGES
     page_dict = page.get_text("dict", flags=flags, sort=True)
     text_length = sum(
@@ -177,9 +307,9 @@ def _page_dict(page: fitz.Page, options: ConversionOptions, page_number: int, wa
         if block.get("type") == 0
     )
 
-    if text_length < 12 and options.ocr_language:
+    if text_length < 12 and options.auto_ocr and ocr_language:
         try:
-            text_page = page.get_textpage_ocr(language=options.ocr_language, dpi=200, full=False)
+            text_page = page.get_textpage_ocr(language=ocr_language, dpi=200, full=False)
             ocr_dict = page.get_text("dict", textpage=text_page, sort=True)
             image_blocks = [block for block in page_dict.get("blocks", []) if block.get("type") == 1]
             ocr_dict["blocks"] = sorted(
@@ -187,10 +317,14 @@ def _page_dict(page: fitz.Page, options: ConversionOptions, page_number: int, wa
                 key=lambda block: (round(block["bbox"][1], 1), block["bbox"][0]),
             )
             page_dict = ocr_dict
+            page_dict["_ocr"] = True
         except Exception as exc:  # PyMuPDF raises a RuntimeError when Tesseract is absent.
             warnings.append(f"第 {page_number} 页 OCR 失败：{exc}")
     elif text_length < 12:
-        warnings.append(f"第 {page_number} 页几乎没有可提取文字，可能是扫描页；可使用 --ocr 指定 OCR 语言。")
+        warnings.append(f"第 {page_number} 页几乎没有可提取文字，可能是扫描页；未检测到可用 OCR。")
+
+    if options.detect_tables:
+        page_dict["_tables"] = _extract_tables(page, warnings)
 
     return page_dict
 
@@ -228,7 +362,13 @@ def convert_pdf(
         raise ValueError("PDF 已加密，需要先移除密码保护")
 
     try:
-        pages = [_page_dict(page, options, index + 1, warnings) for index, page in enumerate(document)]
+        ocr_language = _available_ocr_language(options.ocr_language)
+        if options.auto_ocr and not ocr_language and any(len(page.get_text("text").strip()) < 12 for page in document):
+            if options.ocr_language:
+                warnings.append("未检测到 Tesseract，无法执行 OCR；请安装 Tesseract 后重试。")
+            else:
+                warnings.append("检测到疑似扫描页，但未检测到 Tesseract；安装后将自动进行 OCR。")
+        pages = [_page_dict(page, options, index + 1, warnings, ocr_language) for index, page in enumerate(document)]
         repeated = _repeated_margin_texts(pages) if options.remove_repeated_margins else set()
         body_size = _body_font_size(pages)
         chunks: list[str] = []
@@ -239,7 +379,7 @@ def convert_pdf(
                 chunks.append(f"<!-- 第 {page_index} 页 -->")
             page_image_index = 0
             page_height = float(page["height"])
-            for block in page.get("blocks", []):
+            for block in _ordered_content_blocks(page):
                 block_type = block.get("type")
                 if block_type == 0:
                     plain = _block_plain_text(block)
@@ -247,9 +387,11 @@ def convert_pdf(
                     in_margin = y0 <= page_height * 0.09 or y1 >= page_height * 0.91
                     if in_margin and _normalise_margin_text(plain) in repeated:
                         continue
-                    markdown = _text_block_to_markdown(block, body_size)
+                    markdown = _text_block_to_markdown(block, body_size, ocr=bool(page.get("_ocr")))
                     if markdown:
                         chunks.append(markdown)
+                elif block_type == "table":
+                    chunks.append(block["markdown"])
                 elif block_type == 1:
                     width = int(block.get("width", 0))
                     height = int(block.get("height", 0))

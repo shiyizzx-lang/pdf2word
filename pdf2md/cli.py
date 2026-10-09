@@ -14,7 +14,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input", type=Path, help="输入 PDF 文件")
     parser.add_argument("-o", "--output", type=Path, help="输出 Markdown 文件，默认与 PDF 同名")
-    parser.add_argument("--ocr", metavar="LANG", help="对无文字页面启用 OCR，例如 chi_sim+eng（需安装 Tesseract）")
+    parser.add_argument("--ocr", metavar="LANG", help="指定 OCR 语言，例如 chi_sim+eng；未指定时会自动选择可用语言")
+    parser.add_argument("--no-ocr", action="store_true", help="关闭扫描页的 OCR 自动回退")
     parser.add_argument("--keep-margins", action="store_true", help="保留重复页眉和页脚")
     parser.add_argument("--no-page-markers", action="store_true", help="不输出 HTML 页码注释")
     parser.add_argument("--min-image-size", type=int, default=24, metavar="PX", help="忽略宽或高小于此值的图片（默认 24）")
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_image_width=args.min_image_size,
                 min_image_height=args.min_image_size,
                 ocr_language=args.ocr,
+                auto_ocr=not args.no_ocr,
             ),
         )
     except (OSError, ValueError) as exc:
@@ -48,4 +50,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
